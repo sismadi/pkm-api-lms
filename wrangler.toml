@@ -1,0 +1,21 @@
+name = "cf-api"
+main = "index.js"
+compatibility_date = "2024-09-23"
+
+[vars]
+JWT_SECRET     = "ganti-dengan-secret-panjang-dan-kuat"
+ALLOWED_TABLES = "users,products,orders,courses,enrollments,progress"
+ADMIN_USER     = "admin"
+ADMIN_PASS     = "rahasia123"
+
+# OAuth Client ID dari Google Cloud Console (Credentials → OAuth 2.0 Client ID → Web application)
+GOOGLE_CLIENT_ID   = "ganti-dengan-client-id.apps.googleusercontent.com"
+
+# Whitelist email → role otomatis saat login Google pertama kali (pisahkan koma)
+ADMIN_EMAILS       = "wawan@sismadi.com"
+INSTRUCTOR_EMAILS  = "instruktur1@example.com,instruktur2@example.com"
+
+[[d1_databases]]
+binding      = "DB"
+database_name = "cf-api"
+database_id   = "003854de-0497-4c79-b2a0-e8f6a28daffb"
