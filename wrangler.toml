@@ -9,7 +9,7 @@ ADMIN_USER     = "admin"
 ADMIN_PASS     = "rahasia123"
 
 # OAuth Client ID dari Google Cloud Console (Credentials → OAuth 2.0 Client ID → Web application)
-GOOGLE_CLIENT_ID   = "ganti-dengan-client-id.apps.googleusercontent.com"
+GOOGLE_CLIENT_ID   = "657734502201-3nashfia0j8u3p1lu1n3tpl3tk22p8om.apps.googleusercontent.com"
 
 # Whitelist email → role otomatis saat login Google pertama kali (pisahkan koma)
 ADMIN_EMAILS       = "wawan@sismadi.com"
