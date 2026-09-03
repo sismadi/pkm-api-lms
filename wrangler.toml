@@ -17,5 +17,5 @@ INSTRUCTOR_EMAILS  = "instruktur1@example.com,instruktur2@example.com"
 
 [[d1_databases]]
 binding      = "DB"
-database_name = "cf-api"
-database_id   = "003854de-0497-4c79-b2a0-e8f6a28daffb"
+database_name = "pkm-db-lms"
+database_id   = "8a28cff3-9b5d-454c-9f5e-e333d37a681d"
