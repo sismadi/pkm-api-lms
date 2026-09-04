@@ -467,22 +467,44 @@ async function handleProgress(request, env, slug) {
 //   GET /dashboard         (auth) → data berbeda per role
 //   GET /dashboard/public  (tanpa auth) → agregat aman untuk halaman umum
 
+/**
+ * Rata-rata progres per kursus (dipakai dashboard admin/instruktur).
+ *
+ * PATCH: sebelumnya `totalModules` dihitung dari
+ * `COUNT(DISTINCT p.id)` — yaitu JUMLAH BARIS PROGRES YANG PERNAH
+ * DIBUAT (modul yang pernah dibuka siapa pun), BUKAN jumlah modul
+ * sesungguhnya di kursus itu. Akibatnya peserta yang baru membuka
+ * 1 dari 10 pertemuan langsung dianggap 100% (1 dibagi 1), karena
+ * penyebutnya cuma ikut-ikutan sekecil jumlah modul yang sudah
+ * disentuh, bukan jumlah modul total.
+ *
+ * Sekarang penyebutnya pakai `courses.module_count` (jumlah modul
+ * SEBENARNYA per kursus, sama seperti `moduleCount` di katalog
+ * frontend). avgProgress = total modul selesai (semua peserta) /
+ * (jumlah peserta terdaftar x jumlah modul) — ini setara dengan
+ * rata-rata dari (progres masing-masing peserta), karena
+ * penyebutnya (module_count) sama untuk semua peserta di kursus itu.
+ */
 async function statsCourses(d1) {
   const { results } = await d1.prepare(`
-    SELECT c.id, c.title, c.category,
+    SELECT c.id, c.title, c.category, c.module_count,
            COUNT(DISTINCT e.id) AS enrolledCount,
-           COUNT(DISTINCT CASE WHEN p.completed = 1 THEN p.id END) AS completedModules,
-           COUNT(DISTINCT p.id) AS totalModules
+           COUNT(DISTINCT CASE WHEN p.completed = 1 THEN p.id END) AS completedModules
     FROM courses c
     LEFT JOIN enrollments e ON e.course_id = c.id
     LEFT JOIN progress    p ON p.course_id = c.id
     GROUP BY c.id
     ORDER BY enrolledCount DESC
   `).all();
-  return results.map(r => ({
-    ...r,
-    avgProgress: r.totalModules ? Math.round((r.completedModules / r.totalModules) * 100) : 0,
-  }));
+  return results.map(r => {
+    const totalModules = r.module_count || 0;
+    const denom = (r.enrolledCount || 0) * totalModules;
+    return {
+      ...r,
+      totalModules,
+      avgProgress: denom ? Math.min(100, Math.round((r.completedModules / denom) * 100)) : 0,
+    };
+  });
 }
 
 async function handlePublicDashboard(env) {
@@ -535,10 +557,14 @@ async function handlePrivateDashboard(request, env) {
   if (!uid) {
     return err("Sesi tidak valid (ID pengguna kosong). Silakan logout lalu login ulang dengan Google.", 401);
   }
+  // PATCH: penyebutnya sekarang `c.module_count` (jumlah modul
+  // SEBENARNYA di kursus), bukan `COUNT(DISTINCT p.id)` (jumlah modul
+  // yang KEBETULAN sudah dibuka peserta ini). Sebelumnya baru buka
+  // 1 dari 10 pertemuan langsung terhitung 100% karena penyebutnya
+  // ikut cuma 1. Lihat juga statsCourses() untuk penjelasan sama.
   const { results } = await env.DB.prepare(`
-    SELECT c.id, c.slug, c.title, c.category,
-           COUNT(DISTINCT p.id) AS totalModules,
-           COUNT(DISTINCT CASE WHEN p.completed = 1 THEN p.id END) AS doneModules
+    SELECT c.id, c.slug, c.title, c.category, c.module_count,
+           COUNT(DISTINCT CASE WHEN p.completed = 1 THEN p.module_id END) AS doneModules
     FROM enrollments e
     JOIN courses c ON c.id = e.course_id
     LEFT JOIN progress p ON p.course_id = c.id AND p.user_id = e.user_id
@@ -546,10 +572,14 @@ async function handlePrivateDashboard(request, env) {
     GROUP BY c.id
   `).bind(uid).all();
 
-  const myCourses = results.map(r => ({
-    ...r,
-    progressPct: r.totalModules ? Math.round((r.doneModules / r.totalModules) * 100) : 0,
-  }));
+  const myCourses = results.map(r => {
+    const totalModules = r.module_count || 0;
+    return {
+      ...r,
+      totalModules,
+      progressPct: totalModules ? Math.min(100, Math.round((r.doneModules / totalModules) * 100)) : 0,
+    };
+  });
 
   return ok({
     role: user.role,
