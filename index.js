@@ -381,6 +381,70 @@ async function handleEnroll(request, env, slug) {
 }
 
 // ─────────────────────────────────────────────
+// 6d. ROUTE HANDLER: PROGRESS (aktivitas modul per peserta)
+// ─────────────────────────────────────────────
+//
+//   POST /courses/:slug/progress   (auth wajib)
+//   body: { moduleId: "modul01", completed?: true, score?: number }
+//
+// Dipanggil frontend (progress-patch.js) setiap kali peserta membuka
+// sebuah modul. INSERT ... ON CONFLICT supaya idempotent — dibuka
+// berkali-kali tidak membuat baris dobel, cukup update timestamp/skor
+// (constraint UNIQUE(user_id, course_id, module_id) sudah ada di
+// schema.sql). Ini yang mengisi tabel `progress`, yang sebelumnya jadi
+// alasan "Rata-rata Progres per Kursus" & "Progres Belajar Saya" di
+// dashboard selalu tampil 0%.
+
+async function handleProgress(request, env, slug) {
+  if (request.method !== "POST") return err("Method not allowed", 405);
+
+  const user = await authenticate(request, env.JWT_SECRET);
+  if (!user) return noAuth();
+
+  const uid = user.uid ?? user.sub;
+  if (!uid) {
+    return err("Sesi tidak valid (ID pengguna kosong). Silakan logout lalu login ulang dengan Google.", 401);
+  }
+
+  const body      = await request.json().catch(() => ({}));
+  const moduleId  = String(body.moduleId || "").trim();
+  if (!moduleId) return err("moduleId wajib diisi", 400);
+
+  const completed = body.completed === false ? 0 : 1; // default: aktivitas = selesai dibaca
+  const score     = typeof body.score === "number" ? body.score : null;
+
+  const course = await env.DB.prepare(
+    `SELECT id, title FROM courses WHERE slug = ? LIMIT 1`
+  ).bind(slug).first();
+  if (!course) {
+    return err(`Kursus dengan slug '${slug}' tidak ditemukan.`, 404);
+  }
+
+  // Progres hanya berarti untuk peserta yang benar-benar terdaftar —
+  // ini juga mencegah data progres "nyasar" dari orang yang cuma
+  // membuka materi tanpa mendaftar (materi OCW memang boleh dibaca
+  // publik, tapi progresnya tidak perlu dicatat kalau belum daftar).
+  const enrolled = await env.DB.prepare(
+    `SELECT id FROM enrollments WHERE user_id = ? AND course_id = ? LIMIT 1`
+  ).bind(uid, course.id).first();
+  if (!enrolled) {
+    return err("Anda belum terdaftar di kursus ini — daftar dulu supaya progres tercatat.", 403);
+  }
+
+  const completedAt = completed ? new Date().toISOString() : null;
+  await env.DB.prepare(`
+    INSERT INTO progress (user_id, course_id, module_id, completed, score, completed_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(user_id, course_id, module_id) DO UPDATE SET
+      completed    = excluded.completed,
+      score        = COALESCE(excluded.score, progress.score),
+      completed_at = excluded.completed_at
+  `).bind(uid, course.id, moduleId, completed, score, completedAt).run();
+
+  return ok({ tracked: true, courseId: course.id, moduleId, completed: !!completed });
+}
+
+// ─────────────────────────────────────────────
 // 6d. ROUTE HANDLER: DASHBOARD (privat, role-aware + publik)
 // ─────────────────────────────────────────────
 //
@@ -571,6 +635,11 @@ function parseRoute(pathname) {
   if (parts[0] === "courses" && parts[1] && parts[2] === "enroll") {
     return { type: "enroll", slug: parts[1] };
   }
+  // /courses/:slug/progress  → { type: "progress", slug: ":slug" }   ← BARU
+  // Sama alasannya dengan /enroll: harus dicek sebelum fallback CRUD generik.
+  if (parts[0] === "courses" && parts[1] && parts[2] === "progress") {
+    return { type: "progress", slug: parts[1] };
+  }
   if (parts[0]) return { type: "crud", table: parts[0], id: parts[1] || null };
   return { type: "unknown" };
 }
@@ -621,6 +690,8 @@ export default {
           : await handlePrivateDashboard(request, env);
       else if (route.type === "enroll")
         response = await handleEnroll(request, env, route.slug);
+      else if (route.type === "progress")
+        response = await handleProgress(request, env, route.slug);
       else if (route.type === "crud")
         response = await handleCrud(request, env, route.table, route.id);
       else
