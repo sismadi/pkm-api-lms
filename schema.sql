@@ -79,3 +79,24 @@ INSERT OR IGNORE INTO courses (slug, title, category) VALUES
   ('rpl',      'Rekayasa Perangkat Lunak',      'RPL'),
   ('pbo',      'Pemrograman Berorientasi Objek', 'PBO'),
   ('robotika', 'Robotika Dasar',                 'Robotika');
+
+-- ============================================================
+-- 7) PATCH: jumlah modul SEBENARNYA per kursus — WAJIB dijalankan
+--    Jalankan: wrangler d1 execute pkm-db-lms --file=./schema.sql --remote
+--
+--    Dipakai sebagai PENYEBUT saat menghitung persentase progres
+--    (lihat statsCourses() & handlePrivateDashboard() di index.js).
+--    Sebelum kolom ini ada, penyebutnya salah dihitung dari jumlah
+--    modul yang KEBETULAN sudah dibuka peserta -> baru buka 1 modul
+--    langsung tampil 100%.
+--
+--    HARUS SAMA PERSIS dengan `moduleCount` di CATALOG_COURSES
+--    (catalog-patch.js). Kalau nanti jumlah modul sebuah kursus
+--    berubah, update DUA tempat ini sekaligus (frontend & DB).
+-- ============================================================
+
+ALTER TABLE courses ADD COLUMN module_count INTEGER NOT NULL DEFAULT 0;
+
+UPDATE courses SET module_count = 16 WHERE slug = 'rpl';
+UPDATE courses SET module_count = 12 WHERE slug = 'pbo';
+UPDATE courses SET module_count = 10 WHERE slug = 'robotika';
