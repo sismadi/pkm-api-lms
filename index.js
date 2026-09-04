@@ -206,6 +206,22 @@ async function upsertGoogleUser(d1, profile, env) {
     picture: profile.picture, role, created_at: new Date().toISOString(),
     last_login: new Date().toISOString(),
   });
+
+  // ⚠️ PATCH PENTING: kolom `id` di tabel `users` lama BUKAN alias rowid
+  // asli SQLite (akar masalah yang sama dengan repairNullUserId di atas).
+  // db.insert() TIDAK PERNAH menuliskan `id` (kolom itu tidak ada di body
+  // insert), jadi kalau baris ini dilewati, kolom `id` di database akan
+  // TETAP NULL walau `newId` di memori kelihatan valid. Akibatnya
+  // `INSERT INTO enrollments (user_id, ...)` gagal — user_id=newId, tapi
+  // di tabel users tidak ada baris ber-id=newId (FK constraint) — 500
+  // Internal Server Error persis pada percobaan enroll PERTAMA setelah
+  // registrasi baru. Isi manual `id` pakai rowid milik baris yang baru
+  // saja dibuat (last_row_id == rowid baris tsb, dijamin SQLite).
+  if (newId != null) {
+    await d1.prepare(`UPDATE users SET id = ? WHERE rowid = ? AND id IS NULL`)
+      .bind(newId, newId).run();
+  }
+
   return { id: newId, ...profile, role };
 }
 
