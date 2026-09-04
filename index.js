@@ -148,6 +148,29 @@ function resolveRole(email, env) {
 }
 
 /**
+ * PATCH: perbaiki data lama yang `users.id` nya NULL.
+ *
+ * Root cause: baris user tertentu (mis. dibuat manual lewat D1 Studio
+ * sebelum fitur Google Login ada) punya `id = NULL` karena kolom `id`
+ * pada tabel lama ternyata bukan alias rowid asli. Akibatnya token JWT
+ * dibuat dengan `uid: null`, dan saat enroll query
+ * `INSERT INTO enrollments (user_id, ...)` dibind NULL/undefined →
+ * melanggar constraint `NOT NULL` → 500 Internal Server Error.
+ *
+ * Perbaikan: SQLite/D1 tetap punya `rowid` internal yang unik walau
+ * kolom `id` kosong. Kalau ketemu baris dengan `id` NULL, isi `id`
+ * dengan `rowid` baris itu sendiri (sekali jalan, aman diulang).
+ */
+async function repairNullUserId(d1, row) {
+  if (row.id !== null && row.id !== undefined) return row;
+  await d1.prepare(
+    `UPDATE users SET id = rowid WHERE rowid = (SELECT rowid FROM users WHERE google_id IS ? AND email = ? LIMIT 1) AND id IS NULL`
+  ).bind(row.google_id ?? null, row.email).run();
+  const fixed = await d1.prepare(`SELECT * FROM users WHERE email = ? LIMIT 1`).bind(row.email).first();
+  return fixed || row;
+}
+
+/**
  * Upsert user hasil login Google ke tabel `users` — memakai kembali
  * db.findAll / db.insert / db.update generik (DRY, tanpa query khusus).
  */
@@ -157,7 +180,8 @@ async function upsertGoogleUser(d1, profile, env) {
   });
 
   if (existing.rows[0]) {
-    const row = existing.rows[0];
+    let row = existing.rows[0];
+    row = await repairNullUserId(d1, row); // ⚠️ self-heal data lama yang id-nya NULL
     await db.update(d1, "users", row.id, {
       name: profile.name, picture: profile.picture, last_login: new Date().toISOString(),
     });
@@ -167,7 +191,8 @@ async function upsertGoogleUser(d1, profile, env) {
   // Cocokkan dengan akun lama berbasis email (mis. dibuat manual admin)
   const byEmail = await db.findAll(d1, "users", { where: { email: profile.email }, limit: 1 });
   if (byEmail.rows[0]) {
-    const row = byEmail.rows[0];
+    let row = byEmail.rows[0];
+    row = await repairNullUserId(d1, row); // ⚠️ self-heal data lama yang id-nya NULL
     await db.update(d1, "users", row.id, {
       google_id: profile.googleId, name: profile.name, picture: profile.picture,
       last_login: new Date().toISOString(),
@@ -335,6 +360,13 @@ async function handleEnroll(request, env, slug) {
   }
 
   const uid = user.uid ?? user.sub;
+  if (!uid) {
+    // Token lama terbit sebelum data user diperbaiki (lihat repairNullUserId).
+    // Jangan lanjut insert dengan user_id kosong (akan melanggar NOT NULL
+    // dan muncul sebagai 500 yang membingungkan) — minta login ulang saja,
+    // karena login berikutnya otomatis memperbaiki id yang NULL.
+    return err("Sesi tidak valid (ID pengguna kosong). Silakan logout lalu login ulang dengan Google.", 401);
+  }
   await env.DB.prepare(
     `INSERT OR IGNORE INTO enrollments (user_id, course_id) VALUES (?, ?)`
   ).bind(uid, course.id).run();
@@ -420,6 +452,9 @@ async function handlePrivateDashboard(request, env) {
 
   // ── PESERTA: progres belajar milik sendiri ──
   const uid = user.uid ?? user.sub;
+  if (!uid) {
+    return err("Sesi tidak valid (ID pengguna kosong). Silakan logout lalu login ulang dengan Google.", 401);
+  }
   const { results } = await env.DB.prepare(`
     SELECT c.id, c.slug, c.title, c.category,
            COUNT(DISTINCT p.id) AS totalModules,
