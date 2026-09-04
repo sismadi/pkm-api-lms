@@ -59,3 +59,23 @@ CREATE INDEX IF NOT EXISTS idx_progress_user_course ON progress(user_id, course_
 -- INSERT INTO courses (title, category) VALUES
 --   ('Rekayasa Perangkat Lunak (IMP307)', 'RPL'),
 --   ('Pemrograman Web dengan DonatJS', 'Web');
+
+-- ============================================================
+-- 6) PATCH: fitur "Daftar Kursus" (enroll) — WAJIB dijalankan
+--    Jalankan: wrangler d1 execute pkm-db-lms --file=./schema.sql --remote
+--    Sama seperti bagian (1): SQLite/D1 tidak mendukung
+--    "ADD COLUMN IF NOT EXISTS". Kalau muncul error "duplicate column",
+--    berarti kolom itu sudah pernah ditambahkan -- lewati baris itu saja,
+--    lanjut ke baris berikutnya.
+-- ============================================================
+
+ALTER TABLE courses ADD COLUMN slug TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_courses_slug ON courses(slug);
+
+-- Slug HARUS sama persis dengan `id` di CATALOG_COURSES (catalog-patch.js),
+-- karena tombol "Daftar" memanggil POST /courses/:slug/enroll memakai
+-- nilai `id` itu apa adanya.
+INSERT OR IGNORE INTO courses (slug, title, category) VALUES
+  ('rpl',      'Rekayasa Perangkat Lunak',      'RPL'),
+  ('pbo',      'Pemrograman Berorientasi Objek', 'PBO'),
+  ('robotika', 'Robotika Dasar',                 'Robotika');

@@ -304,6 +304,51 @@ async function handleMe(request, env) {
 }
 
 // ─────────────────────────────────────────────
+// 6c. ROUTE HANDLER: ENROLL (pendaftaran peserta ke kursus)
+// ─────────────────────────────────────────────
+//
+//   POST /courses/:slug/enroll   (auth wajib)
+//
+// SEBELUM patch ini, path `/courses/:id/enroll` TIDAK dikenali router
+// (parseRoute hanya tahu /auth, /me, /dashboard, sisanya jatuh ke CRUD
+// generik). Akibatnya request ini diperlakukan sebagai
+// "POST ke tabel courses dengan id diabaikan" -> body kosong -> 400.
+// Handler khusus ini yang benar: cari kursus lewat `slug`, lalu
+// INSERT OR IGNORE ke tabel enrollments (idempotent -- klik dua kali
+// tidak error, tidak duplikat, karena ada UNIQUE(user_id, course_id)
+// di schema.sql).
+
+async function handleEnroll(request, env, slug) {
+  const user = await authenticate(request, env.JWT_SECRET);
+  if (!user) return noAuth();
+
+  const course = await env.DB.prepare(
+    `SELECT id, title, category FROM courses WHERE slug = ? LIMIT 1`
+  ).bind(slug).first();
+
+  if (!course) {
+    return err(
+      `Kursus dengan slug '${slug}' belum ada di database. ` +
+      `Jalankan migrasi schema.sql (bagian "seed kursus") dulu.`,
+      404
+    );
+  }
+
+  const uid = user.uid ?? user.sub;
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO enrollments (user_id, course_id) VALUES (?, ?)`
+  ).bind(uid, course.id).run();
+
+  return ok({
+    enrolled: true,
+    courseId: course.id,
+    slug,
+    title: course.title,
+    category: course.category,
+  });
+}
+
+// ─────────────────────────────────────────────
 // 6d. ROUTE HANDLER: DASHBOARD (privat, role-aware + publik)
 // ─────────────────────────────────────────────
 //
@@ -374,8 +419,9 @@ async function handlePrivateDashboard(request, env) {
   }
 
   // ── PESERTA: progres belajar milik sendiri ──
+  const uid = user.uid ?? user.sub;
   const { results } = await env.DB.prepare(`
-    SELECT c.id, c.title, c.category,
+    SELECT c.id, c.slug, c.title, c.category,
            COUNT(DISTINCT p.id) AS totalModules,
            COUNT(DISTINCT CASE WHEN p.completed = 1 THEN p.id END) AS doneModules
     FROM enrollments e
@@ -383,7 +429,7 @@ async function handlePrivateDashboard(request, env) {
     LEFT JOIN progress p ON p.course_id = c.id AND p.user_id = e.user_id
     WHERE e.user_id = ?
     GROUP BY c.id
-  `).bind(user.uid).all();
+  `).bind(uid).all();
 
   const myCourses = results.map(r => ({
     ...r,
@@ -406,12 +452,22 @@ async function handlePrivateDashboard(request, env) {
 // 7. ROUTE HANDLER: CRUD GENERIK
 // ─────────────────────────────────────────────
 
+// Tabel yang mengandung data lintas-pengguna (PII/relasi personal) --
+// GET mentah lewat CRUD generik hanya boleh admin/instruktur. Peserta
+// tetap bisa lihat datanya sendiri lewat /me dan /dashboard yang sudah
+// difilter server-side, jadi tidak kehilangan fungsi apa pun.
+const SENSITIVE_TABLES = ["users", "enrollments", "progress"];
+
 async function handleCrud(request, env, table, id) {
   if (!allowedTable(table, env))
     return notFound(`Table '${table}' not found`);
 
   const user = await authenticate(request, env.JWT_SECRET);
   if (!user) return noAuth();
+
+  if (SENSITIVE_TABLES.includes(table) && !hasRole(user, ["admin", "instruktur"])) {
+    return forbidden();
+  }
 
   const method = request.method;
 
@@ -461,18 +517,25 @@ async function handleCrud(request, env, table, id) {
 // ─────────────────────────────────────────────
 
 function parseRoute(pathname) {
-  // /auth/login          → { type: "auth" }
-  // /auth/google         → { type: "auth-google" }
-  // /me                  → { type: "me" }
-  // /dashboard           → { type: "dashboard", scope: "private" }
-  // /dashboard/public    → { type: "dashboard", scope: "public" }
-  // /products            → { type: "crud", table: "products", id: null }
-  // /products/42         → { type: "crud", table: "products", id: "42" }
+  // /auth/login              → { type: "auth" }
+  // /auth/google             → { type: "auth-google" }
+  // /me                      → { type: "me" }
+  // /dashboard               → { type: "dashboard", scope: "private" }
+  // /dashboard/public        → { type: "dashboard", scope: "public" }
+  // /courses/:slug/enroll    → { type: "enroll", slug: ":slug" }   ← BARU
+  // /products                → { type: "crud", table: "products", id: null }
+  // /products/42             → { type: "crud", table: "products", id: "42" }
   const parts = pathname.replace(/^\//, "").split("/");
   if (parts[0] === "auth" && parts[1] === "google") return { type: "auth-google" };
   if (parts[0] === "auth") return { type: "auth" };
   if (parts[0] === "me") return { type: "me" };
   if (parts[0] === "dashboard") return { type: "dashboard", scope: parts[1] === "public" ? "public" : "private" };
+  // PENTING: cek pola /courses/:slug/enroll SEBELUM fallback ke CRUD generik,
+  // supaya tidak salah kena route { table: "courses", id: ":slug" } yang
+  // membuat POST-nya diperlakukan sebagai "insert baris baru ke tabel courses".
+  if (parts[0] === "courses" && parts[1] && parts[2] === "enroll") {
+    return { type: "enroll", slug: parts[1] };
+  }
   if (parts[0]) return { type: "crud", table: parts[0], id: parts[1] || null };
   return { type: "unknown" };
 }
@@ -521,6 +584,8 @@ export default {
         response = route.scope === "public"
           ? await handlePublicDashboard(env)
           : await handlePrivateDashboard(request, env);
+      else if (route.type === "enroll")
+        response = await handleEnroll(request, env, route.slug);
       else if (route.type === "crud")
         response = await handleCrud(request, env, route.table, route.id);
       else
