@@ -100,3 +100,56 @@ ALTER TABLE courses ADD COLUMN module_count INTEGER NOT NULL DEFAULT 0;
 UPDATE courses SET module_count = 16 WHERE slug = 'rpl';
 UPDATE courses SET module_count = 12 WHERE slug = 'pbo';
 UPDATE courses SET module_count = 10 WHERE slug = 'robotika';
+
+-- ============================================================
+-- 9) PATCH: Kuis per kursus + Sertifikat otomatis — WAJIB dijalankan
+--    Jalankan: wrangler d1 execute pkm-db-lms --file=./schema.sql --remote
+--
+--    Alur singkat:
+--      1. Peserta mengerjakan kuis di frontend (quiz-patch.js), skor
+--         dihitung di klien lalu dikirim ke POST /courses/:slug/quiz.
+--      2. Backend menyimpan skor TERBAIK peserta per kursus di tabel
+--         `quiz_results` (idempotent — boleh dikerjakan berkali-kali,
+--         status/nilai selalu mencerminkan percobaan terbaik).
+--      3. Begitu skor terbaik >= passing_grade kursus tsb, backend
+--         OTOMATIS menerbitkan baris baru di tabel `certificates`
+--         (kalau belum pernah ada) dengan kode unik, supaya sertifikat
+--         hanya terbit SEKALI per (peserta, kursus).
+--      4. Dashboard peserta (/dashboard) & verifikasi publik
+--         (/certificates/:code) membaca dua tabel ini.
+-- ============================================================
+
+-- Ambang kelulusan per kursus (dipakai backend untuk menentukan
+-- status 'lulus'/'belum_lulus'). Default 70, boleh dibedakan per kursus.
+ALTER TABLE courses ADD COLUMN passing_grade REAL NOT NULL DEFAULT 70;
+UPDATE courses SET passing_grade = 75 WHERE slug IN ('rpl', 'pbo', 'robotika');
+
+CREATE TABLE IF NOT EXISTS quiz_results (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id       INTEGER NOT NULL,
+  course_id     INTEGER NOT NULL,
+  best_score    REAL NOT NULL DEFAULT 0,
+  last_score    REAL,
+  attempts      INTEGER NOT NULL DEFAULT 0,
+  status        TEXT NOT NULL DEFAULT 'belum_lulus', -- 'lulus' | 'belum_lulus'
+  updated_at    TEXT,
+  UNIQUE(user_id, course_id),
+  FOREIGN KEY (user_id)   REFERENCES users(id),
+  FOREIGN KEY (course_id) REFERENCES courses(id)
+);
+
+CREATE TABLE IF NOT EXISTS certificates (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  code         TEXT NOT NULL,
+  user_id      INTEGER NOT NULL,
+  course_id    INTEGER NOT NULL,
+  score        REAL,
+  issued_at    TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(user_id, course_id),
+  FOREIGN KEY (user_id)   REFERENCES users(id),
+  FOREIGN KEY (course_id) REFERENCES courses(id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cert_code       ON certificates(code);
+CREATE INDEX IF NOT EXISTS idx_quiz_user_course       ON quiz_results(user_id, course_id);
+CREATE INDEX IF NOT EXISTS idx_cert_user              ON certificates(user_id);

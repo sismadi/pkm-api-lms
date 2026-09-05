@@ -461,6 +461,152 @@ async function handleProgress(request, env, slug) {
 }
 
 // ─────────────────────────────────────────────
+// 6e. ROUTE HANDLER: KUIS (submit hasil kuis per kursus)
+// ─────────────────────────────────────────────
+//
+//   POST /courses/:slug/quiz   (auth wajib)
+//   body: { score: number 0-100 }
+//
+// Frontend (quiz-patch.js) menghitung skor di klien lalu mengirimkannya
+// ke sini. Backend TIDAK PERNAH mempercayai status lulus/gagal dari
+// klien — status selalu dihitung ulang di server (score >= passing_grade
+// milik kursus tsb, lihat schema.sql bagian 9), supaya tidak bisa
+// dipalsukan lewat DevTools. Skor TERBAIK peserta disimpan permanen di
+// `quiz_results` (UPSERT, idempotent — boleh dikerjakan berkali-kali).
+//
+// Begitu skor terbaik mencapai passing grade, sertifikat diterbitkan
+// OTOMATIS & HANYA SEKALI per (peserta, kursus) lewat
+// `INSERT OR IGNORE INTO certificates` (constraint UNIQUE(user_id,
+// course_id) mencegah duplikat walau lulus berkali-kali).
+
+function generateCertCode(slug) {
+  const year = new Date().getFullYear();
+  const rand = crypto.randomUUID().split("-")[0].toUpperCase();
+  return `LMS-${slug.toUpperCase()}-${year}-${rand}`;
+}
+
+async function handleQuizSubmit(request, env, slug) {
+  if (request.method !== "POST") return err("Method not allowed", 405);
+
+  const user = await authenticate(request, env.JWT_SECRET);
+  if (!user) return noAuth();
+
+  const uid = user.uid ?? user.sub;
+  if (!uid) {
+    return err("Sesi tidak valid (ID pengguna kosong). Silakan logout lalu login ulang dengan Google.", 401);
+  }
+
+  const body  = await request.json().catch(() => ({}));
+  const score = Number(body.score);
+  if (!Number.isFinite(score) || score < 0 || score > 100) {
+    return err("score wajib berupa angka 0-100", 400);
+  }
+
+  const course = await env.DB.prepare(
+    `SELECT id, title, category, passing_grade FROM courses WHERE slug = ? LIMIT 1`
+  ).bind(slug).first();
+  if (!course) return err(`Kursus dengan slug '${slug}' tidak ditemukan.`, 404);
+
+  // Kuis hanya berarti untuk peserta yang benar-benar terdaftar —
+  // sama seperti aturan pada handleProgress.
+  const enrolled = await env.DB.prepare(
+    `SELECT id FROM enrollments WHERE user_id = ? AND course_id = ? LIMIT 1`
+  ).bind(uid, course.id).first();
+  if (!enrolled) {
+    return err("Anda belum terdaftar di kursus ini — daftar dulu supaya kuis dapat dikerjakan.", 403);
+  }
+
+  const passingGrade = course.passing_grade || 70;
+  const now = new Date().toISOString();
+
+  await env.DB.prepare(`
+    INSERT INTO quiz_results (user_id, course_id, best_score, last_score, attempts, status, updated_at)
+    VALUES (?, ?, ?, ?, 1, ?, ?)
+    ON CONFLICT(user_id, course_id) DO UPDATE SET
+      last_score = excluded.last_score,
+      best_score = MAX(quiz_results.best_score, excluded.last_score),
+      attempts   = quiz_results.attempts + 1,
+      status     = CASE WHEN MAX(quiz_results.best_score, excluded.last_score) >= ?
+                        THEN 'lulus' ELSE 'belum_lulus' END,
+      updated_at = excluded.updated_at
+  `).bind(
+    uid, course.id, score, score, score >= passingGrade ? "lulus" : "belum_lulus", now,
+    passingGrade
+  ).run();
+
+  const result = await env.DB.prepare(
+    `SELECT best_score, last_score, attempts, status FROM quiz_results WHERE user_id = ? AND course_id = ? LIMIT 1`
+  ).bind(uid, course.id).first();
+
+  let certificate = null;
+  if (result && result.status === "lulus") {
+    // Terbitkan sekali saja — kalau sudah ada, ambil yang lama (jangan generate kode baru).
+    let cert = await env.DB.prepare(
+      `SELECT code, score, issued_at FROM certificates WHERE user_id = ? AND course_id = ? LIMIT 1`
+    ).bind(uid, course.id).first();
+
+    if (!cert) {
+      const code = generateCertCode(slug);
+      await env.DB.prepare(`
+        INSERT OR IGNORE INTO certificates (code, user_id, course_id, score, issued_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).bind(code, uid, course.id, result.best_score, now).run();
+      cert = await env.DB.prepare(
+        `SELECT code, score, issued_at FROM certificates WHERE user_id = ? AND course_id = ? LIMIT 1`
+      ).bind(uid, course.id).first();
+    }
+    certificate = cert;
+  }
+
+  return ok({
+    courseId: course.id,
+    slug,
+    score,
+    bestScore: result ? result.best_score : score,
+    attempts: result ? result.attempts : 1,
+    passingGrade,
+    status: result ? result.status : (score >= passingGrade ? "lulus" : "belum_lulus"),
+    certificate,
+  });
+}
+
+// ─────────────────────────────────────────────
+// 6f. ROUTE HANDLER: VERIFIKASI SERTIFIKAT (publik, tanpa login)
+// ─────────────────────────────────────────────
+//
+//   GET /certificates/:code
+//
+// Publik dengan sengaja (siapa pun yang punya kode boleh memverifikasi
+// keasliannya, sama seperti verifikasi sertifikat pada umumnya) — tidak
+// mengekspos data lain milik peserta selain yang relevan untuk sertifikat.
+
+async function handleCertificateLookup(env, code) {
+  if (!code) return notFound("Kode sertifikat wajib diisi");
+
+  const cert = await env.DB.prepare(`
+    SELECT cert.code, cert.score, cert.issued_at,
+           u.name AS name,
+           c.title AS title, c.category AS category
+    FROM certificates cert
+    JOIN users   u ON u.id = cert.user_id
+    JOIN courses c ON c.id = cert.course_id
+    WHERE cert.code = ?
+    LIMIT 1
+  `).bind(code).first();
+
+  if (!cert) return notFound(`Sertifikat dengan kode '${code}' tidak ditemukan / belum diterbitkan.`);
+
+  return ok({
+    code: cert.code,
+    name: cert.name,
+    title: cert.title,
+    category: cert.category,
+    score: cert.score,
+    issued_at: cert.issued_at,
+  });
+}
+
+// ─────────────────────────────────────────────
 // 6d. ROUTE HANDLER: DASHBOARD (privat, role-aware + publik)
 // ─────────────────────────────────────────────
 //
@@ -562,12 +708,25 @@ async function handlePrivateDashboard(request, env) {
   // yang KEBETULAN sudah dibuka peserta ini). Sebelumnya baru buka
   // 1 dari 10 pertemuan langsung terhitung 100% karena penyebutnya
   // ikut cuma 1. Lihat juga statsCourses() untuk penjelasan sama.
+  // PATCH: query diperkaya dengan status/nilai kuis (quiz_results) dan
+  // kode sertifikat (certificates) per kursus, supaya dashboard peserta
+  // bisa menampilkan "Progres Belajar & Kuis Saya" + "Sertifikat Saya"
+  // tanpa request tambahan. LEFT JOIN dipakai karena belum tentu peserta
+  // sudah pernah mengerjakan kuis / lulus untuk kursus tsb.
   const { results } = await env.DB.prepare(`
-    SELECT c.id, c.slug, c.title, c.category, c.module_count,
-           COUNT(DISTINCT CASE WHEN p.completed = 1 THEN p.module_id END) AS doneModules
+    SELECT c.id, c.slug, c.title, c.category, c.module_count, c.passing_grade,
+           COUNT(DISTINCT CASE WHEN p.completed = 1 THEN p.module_id END) AS doneModules,
+           qr.best_score  AS quizBestScore,
+           qr.last_score  AS quizLastScore,
+           qr.attempts    AS quizAttempts,
+           qr.status      AS quizStatus,
+           cert.code      AS certCode,
+           cert.issued_at AS certIssuedAt
     FROM enrollments e
     JOIN courses c ON c.id = e.course_id
     LEFT JOIN progress p ON p.course_id = c.id AND p.user_id = e.user_id
+    LEFT JOIN quiz_results qr ON qr.course_id = c.id AND qr.user_id = e.user_id
+    LEFT JOIN certificates cert ON cert.course_id = c.id AND cert.user_id = e.user_id
     WHERE e.user_id = ?
     GROUP BY c.id
   `).bind(uid).all();
@@ -575,11 +734,27 @@ async function handlePrivateDashboard(request, env) {
   const myCourses = results.map(r => {
     const totalModules = r.module_count || 0;
     return {
-      ...r,
+      id: r.id,
+      slug: r.slug,
+      title: r.title,
+      category: r.category,
       totalModules,
+      doneModules: r.doneModules,
       progressPct: totalModules ? Math.min(100, Math.round((r.doneModules / totalModules) * 100)) : 0,
+      quiz: {
+        passingGrade: r.passing_grade || 70,
+        bestScore: r.quizBestScore ?? null,
+        lastScore: r.quizLastScore ?? null,
+        attempts: r.quizAttempts || 0,
+        status: r.quizStatus || "belum_dikerjakan", // 'lulus' | 'belum_lulus' | 'belum_dikerjakan'
+      },
+      certificate: r.certCode ? { code: r.certCode, issuedAt: r.certIssuedAt } : null,
     };
   });
+
+  const myCertificates = myCourses
+    .filter(c => c.certificate)
+    .map(c => ({ courseTitle: c.title, category: c.category, ...c.certificate }));
 
   return ok({
     role: user.role,
@@ -588,8 +763,11 @@ async function handlePrivateDashboard(request, env) {
       rataRataProgress: myCourses.length
         ? Math.round(myCourses.reduce((a, c) => a + c.progressPct, 0) / myCourses.length)
         : 0,
+      totalKuisLulus: myCourses.filter(c => c.quiz.status === "lulus").length,
+      totalSertifikat: myCertificates.length,
     },
     myCourses,
+    myCertificates,
   });
 }
 
@@ -601,7 +779,7 @@ async function handlePrivateDashboard(request, env) {
 // GET mentah lewat CRUD generik hanya boleh admin/instruktur. Peserta
 // tetap bisa lihat datanya sendiri lewat /me dan /dashboard yang sudah
 // difilter server-side, jadi tidak kehilangan fungsi apa pun.
-const SENSITIVE_TABLES = ["users", "enrollments", "progress"];
+const SENSITIVE_TABLES = ["users", "enrollments", "progress", "quiz_results", "certificates"];
 
 async function handleCrud(request, env, table, id) {
   if (!allowedTable(table, env))
@@ -686,6 +864,18 @@ function parseRoute(pathname) {
   if (parts[0] === "courses" && parts[1] && parts[2] === "progress") {
     return { type: "progress", slug: parts[1] };
   }
+  // /courses/:slug/quiz      → { type: "quiz", slug: ":slug" }         ← BARU
+  // Sama alasannya dengan /enroll & /progress: harus dicek sebelum
+  // fallback CRUD generik.
+  if (parts[0] === "courses" && parts[1] && parts[2] === "quiz") {
+    return { type: "quiz", slug: parts[1] };
+  }
+  // /certificates/:code      → { type: "certLookup", code: ":code" }   ← BARU
+  // Publik (tanpa login) — dicek sebelum fallback CRUD generik supaya
+  // tidak kena guard SENSITIVE_TABLES / whitelist tabel.
+  if (parts[0] === "certificates" && parts[1]) {
+    return { type: "certLookup", code: parts[1] };
+  }
   if (parts[0]) return { type: "crud", table: parts[0], id: parts[1] || null };
   return { type: "unknown" };
 }
@@ -738,6 +928,10 @@ export default {
         response = await handleEnroll(request, env, route.slug);
       else if (route.type === "progress")
         response = await handleProgress(request, env, route.slug);
+      else if (route.type === "quiz")
+        response = await handleQuizSubmit(request, env, route.slug);
+      else if (route.type === "certLookup")
+        response = await handleCertificateLookup(env, route.code);
       else if (route.type === "crud")
         response = await handleCrud(request, env, route.table, route.id);
       else
