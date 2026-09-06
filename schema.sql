@@ -153,3 +153,29 @@ CREATE TABLE IF NOT EXISTS certificates (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_cert_code       ON certificates(code);
 CREATE INDEX IF NOT EXISTS idx_quiz_user_course       ON quiz_results(user_id, course_id);
 CREATE INDEX IF NOT EXISTS idx_cert_user              ON certificates(user_id);
+
+-- ============================================================
+-- 10) PATCH: Admin angkat peserta jadi instruktur + Dashboard Instruktur
+--     Jalankan: wrangler d1 execute pkm-db-lms --file=./schema.sql --remote
+--
+--     Kolom `courses.instructor_id` SUDAH ADA sejak schema awal (lihat
+--     bagian atas file ini) — patch ini HANYA menambah index supaya
+--     query "kursus milik instruktur X" (dipakai handlePrivateDashboard
+--     untuk role instruktur, lihat statsInstructorCourses() di index.js)
+--     tidak full-scan tabel courses. Aman dijalankan berkali-kali.
+--
+--     Alur fitur:
+--       1. Admin login → panel admin memanggil GET /users?role=peserta
+--          untuk menampilkan daftar peserta yang bisa diangkat.
+--       2. Admin klik "Jadikan Instruktur" → PUT /users/:id/role
+--          { role: "instruktur" } (endpoint khusus, admin-only, lihat
+--          handleUserRole() di index.js — TIDAK memakai CRUD generik
+--          supaya lebih ketat daripada PUT /users/:id biasa).
+--       3. Admin menugaskan kursus ke instruktur lewat
+--          PUT /courses/:id { instructor_id: <id user instruktur> }.
+--       4. Instruktur login → GET /dashboard mengembalikan HANYA
+--          kursus miliknya (courses.instructor_id = uid), lengkap
+--          dengan jumlah peserta & rata-rata progres per kursus.
+-- ============================================================
+
+CREATE INDEX IF NOT EXISTS idx_courses_instructor ON courses(instructor_id);

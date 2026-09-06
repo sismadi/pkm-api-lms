@@ -653,6 +653,56 @@ async function statsCourses(d1) {
   });
 }
 
+/**
+ * Statistik kursus MILIK SEORANG INSTRUKTUR saja (courses.instructor_id
+ * = instructorId) — dasar untuk "Dashboard Instruktur": berapa kursus
+ * yang dia ampu, berapa peserta di tiap kursus, rata-rata progres, dan
+ * berapa peserta yang sudah lulus kuis di kursus tsb.
+ *
+ * Pola query & perhitungan avgProgress SENGAJA disamakan dengan
+ * statsCourses() di atas (Reuse · DRY) — bedanya hanya WHERE
+ * c.instructor_id = ? dan tambahan kolom lulusCount.
+ */
+async function statsInstructorCourses(d1, instructorId) {
+  const { results } = await d1.prepare(`
+    SELECT c.id, c.slug, c.title, c.category, c.module_count,
+           COUNT(DISTINCT e.user_id) AS enrolledCount,
+           COUNT(DISTINCT CASE WHEN p.completed = 1 THEN p.id END) AS completedModules,
+           COUNT(DISTINCT CASE WHEN qr.status = 'lulus' THEN qr.user_id END) AS lulusCount
+    FROM courses c
+    LEFT JOIN enrollments  e  ON e.course_id  = c.id
+    LEFT JOIN progress     p  ON p.course_id  = c.id
+    LEFT JOIN quiz_results qr ON qr.course_id = c.id
+    WHERE c.instructor_id = ?
+    GROUP BY c.id
+    ORDER BY enrolledCount DESC
+  `).bind(instructorId).all();
+
+  return results.map(r => {
+    const totalModules = r.module_count || 0;
+    const denom = (r.enrolledCount || 0) * totalModules;
+    return {
+      ...r,
+      totalModules,
+      avgProgress: denom ? Math.min(100, Math.round((r.completedModules / denom) * 100)) : 0,
+    };
+  });
+}
+
+/** Daftar instruktur + berapa kursus yang diampu masing-masing — dipakai dashboard admin. */
+async function listInstructorsWithCourseCount(d1) {
+  const { results } = await d1.prepare(`
+    SELECT u.id, u.name, u.email,
+           COUNT(c.id) AS courseCount
+    FROM users u
+    LEFT JOIN courses c ON c.instructor_id = u.id
+    WHERE u.role = 'instruktur'
+    GROUP BY u.id
+    ORDER BY u.name ASC
+  `).all();
+  return results;
+}
+
 async function handlePublicDashboard(env) {
   const totalPeserta = await env.DB.prepare(
     `SELECT COUNT(*) AS n FROM users WHERE role = 'peserta'`
@@ -673,8 +723,8 @@ async function handlePrivateDashboard(request, env) {
   const user = await authenticate(request, env.JWT_SECRET);
   if (!user) return noAuth();
 
-  // ── ADMIN & INSTRUKTUR: ringkasan seluruh platform ──
-  if (hasRole(user, ["admin", "instruktur"])) {
+  // ── ADMIN: ringkasan SELURUH platform + daftar instruktur ──
+  if (hasRole(user, ["admin"])) {
     const totalPeserta = await env.DB.prepare(
       `SELECT COUNT(*) AS n FROM users WHERE role = 'peserta'`
     ).first("n");
@@ -684,6 +734,10 @@ async function handlePrivateDashboard(request, env) {
     const totalCourses = await env.DB.prepare(`SELECT COUNT(*) AS n FROM courses`).first("n");
     const totalEnrollments = await env.DB.prepare(`SELECT COUNT(*) AS n FROM enrollments`).first("n");
     const courses = await statsCourses(env.DB);
+    // PATCH: daftar instruktur + jumlah kursus yang diampu masing-masing,
+    // dipakai panel admin (mis. untuk menimbang siapa yang diberi kursus
+    // baru, atau siapa yang mau dikembalikan jadi peserta).
+    const instructors = await listInstructorsWithCourseCount(env.DB);
 
     return ok({
       role: user.role,
@@ -695,6 +749,41 @@ async function handlePrivateDashboard(request, env) {
       },
       topCourses: courses.slice(0, 5),
       allCourses: courses,
+      instructors,
+    });
+  }
+
+  // ── INSTRUKTUR: HANYA kursus yang dia ampu (courses.instructor_id) ──
+  // PATCH: sebelumnya instruktur melihat data yang SAMA PERSIS dengan
+  // admin (ringkasan seluruh platform) — sekarang di-scope ke kursusnya
+  // sendiri saja: berapa kursus, berapa peserta di tiap kursus, rata-rata
+  // progres, dan berapa yang sudah lulus kuis. Ini yang dimaksud
+  // "Dashboard Instruktur" (banyak kursusnya, peserta kursusnya, dll).
+  if (hasRole(user, ["instruktur"])) {
+    const iid = user.uid ?? user.sub;
+    if (!iid) {
+      return err("Sesi tidak valid (ID pengguna kosong). Silakan logout lalu login ulang dengan Google.", 401);
+    }
+
+    const myCourses = await statsInstructorCourses(env.DB, iid);
+    const totalPesertaUnik = await env.DB.prepare(`
+      SELECT COUNT(DISTINCT e.user_id) AS n
+      FROM enrollments e
+      JOIN courses c ON c.id = e.course_id
+      WHERE c.instructor_id = ?
+    `).bind(iid).first("n");
+
+    return ok({
+      role: user.role,
+      summary: {
+        totalKursus: myCourses.length,
+        totalPeserta: totalPesertaUnik || 0,
+        rataRataProgress: myCourses.length
+          ? Math.round(myCourses.reduce((a, c) => a + c.avgProgress, 0) / myCourses.length)
+          : 0,
+        totalLulusKuis: myCourses.reduce((a, c) => a + (c.lulusCount || 0), 0),
+      },
+      myCourses,
     });
   }
 
@@ -772,6 +861,68 @@ async function handlePrivateDashboard(request, env) {
 }
 
 // ─────────────────────────────────────────────
+// 6e. ROUTE HANDLER: UBAH ROLE PENGGUNA (admin mengangkat peserta
+//     menjadi instruktur, atau mengembalikan instruktur ke peserta)
+// ─────────────────────────────────────────────
+//
+//   PUT /users/:id/role   (auth wajib, role admin SAJA)
+//   body: { role: "instruktur" | "peserta" }
+//
+// Sengaja dibuat sebagai handler khusus (bukan lewat CRUD generik
+// PUT /users/:id) supaya:
+//   1. Hanya "admin" yang boleh (CRUD generik users mengizinkan
+//      admin MAUPUN instruktur, karena keduanya sama-sama lolos
+//      guard SENSITIVE_TABLES — role change harus lebih ketat).
+//   2. Role tujuan dibatasi whitelist ["peserta","instruktur"] —
+//      role "admin" tidak bisa diberikan lewat endpoint ini, untuk
+//      mencegah eskalasi hak akses (admin baru hanya dibuat manual
+//      lewat wrangler.toml ADMIN_EMAILS / D1 langsung).
+//   3. Akun yang SUDAH admin tidak bisa diturunkan lewat endpoint
+//      ini (jaga-jaga dari salah klik / body yang keliru).
+
+const ASSIGNABLE_ROLES = ["peserta", "instruktur"];
+
+async function handleUserRole(request, env, id) {
+  if (request.method !== "PUT") return err("Method not allowed", 405);
+
+  const actor = await authenticate(request, env.JWT_SECRET);
+  if (!actor) return noAuth();
+  if (!hasRole(actor, ["admin"])) return forbidden();
+
+  const body    = await request.json().catch(() => ({}));
+  const newRole = String(body.role || "").trim();
+  if (!ASSIGNABLE_ROLES.includes(newRole)) {
+    return err(`role harus salah satu dari: ${ASSIGNABLE_ROLES.join(", ")}`, 400);
+  }
+
+  const target = await db.findOne(env.DB, "users", id);
+  if (!target) return notFound("Pengguna tidak ditemukan");
+
+  if (target.role === "admin") {
+    return err("Role akun admin tidak bisa diubah lewat endpoint ini.", 403);
+  }
+
+  if (target.role === newRole) {
+    return ok({
+      id: target.id, name: target.name, email: target.email, role: target.role,
+      message: `${target.name} memang sudah berperan sebagai ${newRole}.`,
+    });
+  }
+
+  await db.update(env.DB, "users", id, { role: newRole });
+
+  return ok({
+    id: target.id,
+    name: target.name,
+    email: target.email,
+    role: newRole,
+    message: newRole === "instruktur"
+      ? `${target.name} sekarang menjadi instruktur.`
+      : `${target.name} dikembalikan menjadi peserta.`,
+  });
+}
+
+// ─────────────────────────────────────────────
 // 7. ROUTE HANDLER: CRUD GENERIK
 // ─────────────────────────────────────────────
 
@@ -780,6 +931,14 @@ async function handlePrivateDashboard(request, env) {
 // tetap bisa lihat datanya sendiri lewat /me dan /dashboard yang sudah
 // difilter server-side, jadi tidak kehilangan fungsi apa pun.
 const SENSITIVE_TABLES = ["users", "enrollments", "progress", "quiz_results", "certificates"];
+
+// PATCH: `courses` TIDAK ada di SENSITIVE_TABLES (GET publik untuk katalog),
+// tapi PENULISANNYA (POST/PUT/DELETE) tetap harus dibatasi admin/instruktur.
+// Sebelum patch ini, peserta yang login bisa PUT /courses/:id dan mengubah
+// `instructor_id` miliknya sendiri — celah serius sekarang bahwa
+// `instructor_id` dipakai sebagai dasar Dashboard Instruktur. `id` di sini
+// sengaja dipisah dari SENSITIVE_TABLES karena GET tetap boleh publik.
+const WRITE_RESTRICTED_TABLES = ["courses"];
 
 async function handleCrud(request, env, table, id) {
   if (!allowedTable(table, env))
@@ -794,6 +953,14 @@ async function handleCrud(request, env, table, id) {
 
   const method = request.method;
 
+  if (
+    WRITE_RESTRICTED_TABLES.includes(table) &&
+    method !== "GET" &&
+    !hasRole(user, ["admin", "instruktur"])
+  ) {
+    return forbidden();
+  }
+
   // LIST
   if (method === "GET" && !id) {
     const url    = new URL(request.url);
@@ -801,7 +968,19 @@ async function handleCrud(request, env, table, id) {
     const limit  = url.searchParams.get("limit")   || 20;
     const order  = url.searchParams.get("orderBy") || "id";
     const dir    = (url.searchParams.get("dir") || "ASC").toUpperCase() === "DESC" ? "DESC" : "ASC";
-    const result = await db.findAll(env.DB, table, { orderBy: order, dir, page, limit });
+    // PATCH: filter `?role=peserta` / `?role=instruktur` khusus tabel `users`
+    // — dipakai panel admin untuk menampilkan daftar peserta yang bisa
+    // diangkat jadi instruktur, tanpa perlu endpoint baru terpisah
+    // (Reuse · DRY, whitelist ketat supaya tidak bisa dipakai filter
+    // kolom sembarangan pada tabel lain).
+    const where = {};
+    if (table === "users") {
+      const roleFilter = url.searchParams.get("role");
+      if (roleFilter && ["admin", "instruktur", "peserta"].includes(roleFilter)) {
+        where.role = roleFilter;
+      }
+    }
+    const result = await db.findAll(env.DB, table, { where, orderBy: order, dir, page, limit });
     return ok(result.rows, { total: result.total, page: result.page, limit: result.limit });
   }
 
@@ -846,6 +1025,7 @@ function parseRoute(pathname) {
   // /dashboard               → { type: "dashboard", scope: "private" }
   // /dashboard/public        → { type: "dashboard", scope: "public" }
   // /courses/:slug/enroll    → { type: "enroll", slug: ":slug" }   ← BARU
+  // /users/:id/role          → { type: "userRole", id: ":id" }     ← BARU (admin angkat instruktur)
   // /products                → { type: "crud", table: "products", id: null }
   // /products/42             → { type: "crud", table: "products", id: "42" }
   const parts = pathname.replace(/^\//, "").split("/");
@@ -875,6 +1055,15 @@ function parseRoute(pathname) {
   // tidak kena guard SENSITIVE_TABLES / whitelist tabel.
   if (parts[0] === "certificates" && parts[1]) {
     return { type: "certLookup", code: parts[1] };
+  }
+  // /users/:id/role          → { type: "userRole", id: ":id" }         ← BARU
+  // PENTING: cek SEBELUM fallback CRUD generik, dengan alasan sama
+  // seperti /courses/:slug/enroll — kalau tidak, path ini akan salah
+  // kena route { table: "users", id: ":id" } (segmen "role" diabaikan)
+  // dan berakhir sebagai PUT /users/:id biasa lewat handleCrud, yang
+  // guard-nya lebih longgar (admin ATAU instruktur, bukan admin saja).
+  if (parts[0] === "users" && parts[1] && parts[2] === "role") {
+    return { type: "userRole", id: parts[1] };
   }
   if (parts[0]) return { type: "crud", table: parts[0], id: parts[1] || null };
   return { type: "unknown" };
@@ -932,6 +1121,8 @@ export default {
         response = await handleQuizSubmit(request, env, route.slug);
       else if (route.type === "certLookup")
         response = await handleCertificateLookup(env, route.code);
+      else if (route.type === "userRole")
+        response = await handleUserRole(request, env, route.id);
       else if (route.type === "crud")
         response = await handleCrud(request, env, route.table, route.id);
       else
