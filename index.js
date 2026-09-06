@@ -226,6 +226,39 @@ async function upsertGoogleUser(d1, profile, env) {
 }
 
 // ─────────────────────────────────────────────
+// 4c. VALIDASI URL — dipakai fitur "Pengelolaan Berkas" (materials)
+// ─────────────────────────────────────────────
+//
+// Zero-dependency: regex sederhana, tidak butuh library parsing URL pihak ketiga.
+
+function isHttpUrl(str) {
+  try {
+    const u = new URL(String(str || ""));
+    return u.protocol === "http:" || u.protocol === "https:";
+  } catch (e) {
+    return false;
+  }
+}
+
+/** Ekstrak video ID dari berbagai format URL YouTube. null kalau tidak valid. */
+function extractYouTubeId(url) {
+  if (!isHttpUrl(url)) return null;
+  const patterns = [
+    /(?:youtube\.com\/watch\?v=)([a-zA-Z0-9_-]{11})/,
+    /(?:youtu\.be\/)([a-zA-Z0-9_-]{11})/,
+    /(?:youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/,
+    /(?:youtube\.com\/shorts\/)([a-zA-Z0-9_-]{11})/,
+  ];
+  for (const re of patterns) {
+    const m = String(url).match(re);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+const MATERIAL_TYPES = ["video", "pdf"];
+
+// ─────────────────────────────────────────────
 // 5. QUERY BUILDER — GENERIK UNTUK SEMUA TABEL
 // ─────────────────────────────────────────────
 
@@ -923,6 +956,193 @@ async function handleUserRole(request, env, id) {
 }
 
 // ─────────────────────────────────────────────
+// 6f. ROUTE HANDLER: PENGELOLAAN BERKAS (materi video YouTube & PDF)
+// ─────────────────────────────────────────────
+//
+//   GET    /courses/:slug/materials            (publik, tanpa login)
+//          Query opsional: ?module=modul01 → hanya kembalikan berkas
+//          milik modul itu + berkas umum (module_id NULL).
+//   POST   /courses/:slug/materials            (auth: pemilik kursus/admin)
+//          body: { type: 'video'|'pdf', title, url, description?, module_id? }
+//   PUT    /materials/:id                      (auth: pemilik kursus/admin)
+//   DELETE /materials/:id                      (auth: pemilik kursus/admin)
+//   GET    /materials/:id                      (publik — detail satu berkas)
+//
+// Dibuat sebagai handler khusus (bukan CRUD generik) karena butuh:
+//   1. GET publik (materi OCW boleh dibaca siapa saja, sama seperti
+//      alasan `courses` tidak masuk SENSITIVE_TABLES).
+//   2. Otorisasi berbasis KEPEMILIKAN kursus (courses.instructor_id),
+//      bukan sekadar role — CRUD generik hanya tahu role, tidak tahu
+//      "instruktur ini pemilik baris yang mana", sehingga instruktur A
+//      bisa saja menambah/menghapus berkas milik kursus instruktur B
+//      kalau lewat CRUD generik. Di sini itu SENGAJA dicegah.
+
+/** true kalau `user` boleh menulis (POST/PUT/DELETE) berkas milik `course`. */
+function canManageCourseMaterials(user, course) {
+  if (!course) return false;
+  if (hasRole(user, ["admin"])) return true;
+  if (hasRole(user, ["instruktur"])) {
+    const uid = user.uid ?? user.sub;
+    return uid != null && String(course.instructor_id) === String(uid);
+  }
+  return false;
+}
+
+function serializeMaterial(row) {
+  return {
+    id: row.id,
+    course_id: row.course_id,
+    module_id: row.module_id || null,
+    type: row.type,
+    title: row.title,
+    url: row.url,
+    description: row.description || null,
+    // Dihitung ulang di server tiap kali dibaca — supaya frontend tinggal
+    // pakai (embed iframe) tanpa perlu regex ulang di sisi klien.
+    youtubeId: row.type === "video" ? extractYouTubeId(row.url) : null,
+    created_by: row.created_by,
+    created_at: row.created_at,
+  };
+}
+
+/** Validasi & normalisasi body POST/PUT — dipakai ulang oleh keduanya (DRY). */
+function validateMaterialBody(body, { partial = false } = {}) {
+  const out = {};
+
+  if (!partial || body.type !== undefined) {
+    const type = String(body.type || "").trim().toLowerCase();
+    if (!MATERIAL_TYPES.includes(type)) {
+      return { error: `type wajib salah satu dari: ${MATERIAL_TYPES.join(", ")}` };
+    }
+    out.type = type;
+  }
+
+  if (!partial || body.title !== undefined) {
+    const title = String(body.title || "").trim();
+    if (!title) return { error: "title wajib diisi" };
+    out.title = title;
+  }
+
+  if (!partial || body.url !== undefined) {
+    const url = String(body.url || "").trim();
+    if (!isHttpUrl(url)) return { error: "url tidak valid (harus diawali http:// atau https://)" };
+
+    const effectiveType = out.type || body._existingType;
+    if (effectiveType === "video" && !extractYouTubeId(url)) {
+      return { error: "URL video harus berupa tautan YouTube yang valid (watch?v=, youtu.be/, embed/, atau /shorts/)" };
+    }
+    if (effectiveType === "pdf" && !/\.pdf($|\?)/i.test(url)) {
+      // Bukan hard-block (banyak link Google Drive/PDF hosting tidak
+      // berakhiran .pdf) — hanya validasi kalau URL memang berbentuk file lain.
+      // Tetap terima, tapi pastikan bukan tautan YouTube yang salah tempel.
+      if (extractYouTubeId(url)) {
+        return { error: "URL ini terdeteksi sebagai tautan YouTube — pilih jenis 'Video' untuk berkas ini" };
+      }
+    }
+    out.url = url;
+  }
+
+  if (body.description !== undefined) {
+    out.description = body.description ? String(body.description).trim() : null;
+  }
+
+  if (body.module_id !== undefined) {
+    const moduleId = body.module_id ? String(body.module_id).trim() : null;
+    out.module_id = moduleId || null;
+  }
+
+  return { value: out };
+}
+
+async function handleMaterials(request, env, slug) {
+  const course = await env.DB.prepare(
+    `SELECT id, slug, title, instructor_id FROM courses WHERE slug = ? LIMIT 1`
+  ).bind(slug).first();
+  if (!course) return notFound(`Kursus dengan slug '${slug}' tidak ditemukan.`);
+
+  if (request.method === "GET") {
+    const url = new URL(request.url);
+    const moduleFilter = url.searchParams.get("module");
+
+    let sql = `SELECT * FROM materials WHERE course_id = ?`;
+    const binds = [course.id];
+    if (moduleFilter) {
+      sql += ` AND (module_id = ? OR module_id IS NULL OR module_id = '')`;
+      binds.push(moduleFilter);
+    }
+    sql += ` ORDER BY created_at ASC`;
+
+    const { results } = await env.DB.prepare(sql).bind(...binds).all();
+    return ok(results.map(serializeMaterial));
+  }
+
+  if (request.method === "POST") {
+    const user = await authenticate(request, env.JWT_SECRET);
+    if (!user) return noAuth();
+    if (!canManageCourseMaterials(user, course)) return forbidden();
+
+    const uid = user.uid ?? user.sub;
+    const body = await request.json().catch(() => ({}));
+    const { value, error } = validateMaterialBody(body);
+    if (error) return err(error, 400);
+
+    const now = new Date().toISOString();
+    const insertId = await db.insert(env.DB, "materials", {
+      course_id: course.id,
+      module_id: value.module_id ?? null,
+      type: value.type,
+      title: value.title,
+      url: value.url,
+      description: value.description ?? null,
+      created_by: uid ?? null,
+      created_at: now,
+    });
+
+    const row = await db.findOne(env.DB, "materials", insertId);
+    return ok(serializeMaterial(row), { status: 201 });
+  }
+
+  return err("Method not allowed", 405);
+}
+
+async function handleMaterialItem(request, env, id) {
+  const row = await db.findOne(env.DB, "materials", id);
+  if (!row) return notFound("Berkas tidak ditemukan");
+
+  if (request.method === "GET") {
+    return ok(serializeMaterial(row));
+  }
+
+  // PUT & DELETE butuh login + kepemilikan kursus
+  const user = await authenticate(request, env.JWT_SECRET);
+  if (!user) return noAuth();
+
+  const course = await env.DB.prepare(
+    `SELECT id, slug, instructor_id FROM courses WHERE id = ? LIMIT 1`
+  ).bind(row.course_id).first();
+  if (!canManageCourseMaterials(user, course)) return forbidden();
+
+  if (request.method === "PUT") {
+    const body = await request.json().catch(() => ({}));
+    body._existingType = row.type; // dipakai validateMaterialBody untuk validasi URL saat type tidak diubah
+    const { value, error } = validateMaterialBody(body, { partial: true });
+    if (error) return err(error, 400);
+    if (!Object.keys(value).length) return err("Tidak ada field yang diubah");
+
+    await db.update(env.DB, "materials", id, value);
+    const updated = await db.findOne(env.DB, "materials", id);
+    return ok(serializeMaterial(updated));
+  }
+
+  if (request.method === "DELETE") {
+    const deleted = await db.remove(env.DB, "materials", id);
+    return deleted ? ok({ deleted: true }) : notFound();
+  }
+
+  return err("Method not allowed", 405);
+}
+
+// ─────────────────────────────────────────────
 // 7. ROUTE HANDLER: CRUD GENERIK
 // ─────────────────────────────────────────────
 
@@ -1065,6 +1285,20 @@ function parseRoute(pathname) {
   if (parts[0] === "users" && parts[1] && parts[2] === "role") {
     return { type: "userRole", id: parts[1] };
   }
+  // /courses/:slug/materials → { type: "materials", slug: ":slug" }    ← BARU
+  // Fitur "Pengelolaan Berkas" (video YouTube & PDF oleh instruktur).
+  // Sama alasannya dengan /enroll, /progress & /quiz: harus dicek
+  // sebelum fallback CRUD generik.
+  if (parts[0] === "courses" && parts[1] && parts[2] === "materials") {
+    return { type: "materials", slug: parts[1] };
+  }
+  // /materials/:id          → { type: "materialItem", id: ":id" }     ← BARU
+  // Endpoint terpisah (bukan CRUD generik) karena otorisasinya berbasis
+  // kepemilikan kursus (courses.instructor_id), bukan sekadar role —
+  // lihat canManageCourseMaterials() & komentar di handleMaterialItem().
+  if (parts[0] === "materials" && parts[1]) {
+    return { type: "materialItem", id: parts[1] };
+  }
   if (parts[0]) return { type: "crud", table: parts[0], id: parts[1] || null };
   return { type: "unknown" };
 }
@@ -1123,6 +1357,10 @@ export default {
         response = await handleCertificateLookup(env, route.code);
       else if (route.type === "userRole")
         response = await handleUserRole(request, env, route.id);
+      else if (route.type === "materials")
+        response = await handleMaterials(request, env, route.slug);
+      else if (route.type === "materialItem")
+        response = await handleMaterialItem(request, env, route.id);
       else if (route.type === "crud")
         response = await handleCrud(request, env, route.table, route.id);
       else

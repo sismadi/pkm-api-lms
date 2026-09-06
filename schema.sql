@@ -179,3 +179,46 @@ CREATE INDEX IF NOT EXISTS idx_cert_user              ON certificates(user_id);
 -- ============================================================
 
 CREATE INDEX IF NOT EXISTS idx_courses_instructor ON courses(instructor_id);
+
+-- ============================================================
+-- 11) PATCH: Pengelolaan Berkas (Video YouTube & PDF) oleh Instruktur
+--     Jalankan: wrangler d1 execute pkm-db-lms --file=./migrate-materials.sql --remote
+--     (file terpisah `migrate-materials.sql` — SAMA ISINYA dengan blok di bawah,
+--     dipisah supaya bisa dijalankan sendiri tanpa mengulang seluruh schema.sql)
+--
+--     Alur fitur:
+--       1. Instruktur login → buka halaman "Kelola Berkas" (frontend:
+--          materials-patch.js) → pilih salah satu kursus yang diampunya.
+--       2. Instruktur mengisi form: jenis berkas (Video YouTube / PDF),
+--          judul, URL, deskripsi opsional, dan modul terkait (opsional —
+--          kosongkan untuk "materi umum" seluruh kursus).
+--       3. Frontend memanggil POST /courses/:slug/materials (auth wajib).
+--          Backend (handleMaterials di index.js) memvalidasi bahwa
+--          instruktur tsb memang pemilik kursus (courses.instructor_id),
+--          memvalidasi format URL (YouTube harus punya video ID valid),
+--          lalu menyimpan baris baru ke tabel `materials`.
+--       4. Peserta yang membuka halaman materi (learn/pbo/robotika)
+--          otomatis melihat berkas ini lewat GET /courses/:slug/materials
+--          (endpoint publik, tanpa login — sama seperti materi OCW
+--          lainnya yang boleh dibaca publik).
+--       5. Instruktur bisa menghapus berkas lewat DELETE /materials/:id
+--          (hanya pemilik kursus atau admin).
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS materials (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  course_id    INTEGER NOT NULL,
+  module_id    TEXT,                    -- opsional: id modul spesifik (mis. 'modul01').
+                                         -- NULL/kosong = berlaku untuk seluruh kursus.
+  type         TEXT NOT NULL,           -- 'video' (YouTube) | 'pdf'
+  title        TEXT NOT NULL,
+  url          TEXT NOT NULL,
+  description  TEXT,
+  created_by   INTEGER,
+  created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (course_id)  REFERENCES courses(id),
+  FOREIGN KEY (created_by) REFERENCES users(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_materials_course        ON materials(course_id);
+CREATE INDEX IF NOT EXISTS idx_materials_course_module ON materials(course_id, module_id);
